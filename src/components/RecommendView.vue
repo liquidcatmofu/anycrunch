@@ -115,66 +115,80 @@ const formatOptions = computed(() => {
 
 // ── Hardware acceleration detection ──────────────────────────────────────
 
+const hasH264HW = computed(() =>
+  store.hwAccel.some(h => ['nvenc_h264', 'amf_h264', 'qsv_h264', 'videotoolbox_h264'].includes(h)),
+)
+const hasHEVCHW = computed(() =>
+  store.hwAccel.some(h => ['nvenc_hevc', 'amf_hevc', 'qsv_hevc', 'videotoolbox_hevc'].includes(h)),
+)
 const hasAV1HW = computed(() =>
   store.hwAccel.some(h => ['nvenc_av1', 'amf_av1', 'qsv_av1'].includes(h)),
 )
 
-const hasHEVCHW = computed(() =>
-  store.hwAccel.some(h => ['nvenc_hevc', 'amf_hevc', 'qsv_hevc', 'videotoolbox_hevc'].includes(h)),
-)
+// ── Video: separate container + codec selection ───────────────────────────
 
-// ── Video: combined format+codec options (convert mode) ───────────────────
-// Bundling prevents invalid combos like WebM+H.264.
+const VIDEO_CONTAINERS = [
+  { value: 'mp4',  label: 'MP4',  note: '互換性最高' },
+  { value: 'mkv',  label: 'MKV',  note: '高品質保存' },
+  { value: 'webm', label: 'WebM', note: 'Web向け' },
+] as const
 
-interface VideoOption {
-  value: string; label: string; format: string; codec: string; note: string
-  warnLevel?: 'caution' | 'strong'
+const VIDEO_CODECS = [
+  { value: 'h264', label: 'H.264', note: '高速・高互換' },
+  { value: 'h265', label: 'H.265', note: '高圧縮' },
+  { value: 'av1',  label: 'AV1',   note: '次世代' },
+] as const
+
+function isContainerDisabled(container: string): boolean {
+  const codec = store.selectedCodec
+  if (container === 'webm') {
+    if (codec === 'h264' || codec === 'h265') return true
+    // HW AV1 encoders (nvenc/amf/qsv) cannot mux into WebM
+    if (codec === 'av1' && hasAV1HW.value) return true
+  }
+  return false
 }
 
-const ALL_VIDEO_CONVERT_OPTIONS: VideoOption[] = [
-  { value: 'mp4-h264',  label: 'MP4',  format: 'mp4',  codec: 'libx264',    note: 'H.264 · 互換性最高' },
-  { value: 'mp4-h265',  label: 'MP4',  format: 'mp4',  codec: 'libx265',    note: 'H.265 · 高圧縮' },
-  { value: 'webm-av1',  label: 'WebM', format: 'webm', codec: 'libaom-av1', note: 'AV1 · Web向け' },
-  { value: 'mkv-h265',  label: 'MKV',  format: 'mkv',  codec: 'libx265',    note: 'H.265 · 高品質保存' },
-]
+function isCodecDisabled(codec: string): boolean {
+  return codec === 'av1' && !hasAV1HW.value && !store.settings.allowCpuAV1
+}
 
-// AV1: hidden when no HW encoder unless allowCpuAV1 is set
-const VIDEO_CONVERT_OPTIONS = computed((): VideoOption[] =>
-  ALL_VIDEO_CONVERT_OPTIONS
-    .filter(opt => {
-      if (opt.codec === 'libaom-av1')
-        return hasAV1HW.value || store.settings.allowCpuAV1
-      return true
-    })
-    .map(opt => ({
-      ...opt,
-      warnLevel: (opt.codec === 'libaom-av1' && !hasAV1HW.value) ? 'strong'
-               : (opt.codec === 'libx265'    && !hasHEVCHW.value) ? 'caution'
-               : undefined,
-    })),
-)
+function getCodecHwBadge(codec: string): string | null {
+  const hw = store.hwAccel
+  const map: Record<string, string[]> = {
+    h264: ['nvenc_h264', 'amf_h264', 'qsv_h264', 'videotoolbox_h264'],
+    h265: ['nvenc_hevc', 'amf_hevc', 'qsv_hevc', 'videotoolbox_hevc'],
+    av1:  ['nvenc_av1',  'amf_av1',  'qsv_av1'],
+  }
+  return map[codec]?.some(h => hw.includes(h)) ? 'HW' : null
+}
 
-// Warning for the currently selected video option
-const selectedVideoWarning = computed((): { level: 'caution' | 'strong'; message: string } | null => {
-  const opt = ALL_VIDEO_CONVERT_OPTIONS.find(o => o.value === selectedVideoOption.value)
-  if (!opt) return null
-  if (opt.codec === 'libaom-av1' && !hasAV1HW.value)
-    return { level: 'strong',  message: 'AV1 のハードウェアエンコーダが見つかりません。CPU エンコードは非常に時間がかかります（数時間以上になる場合があります）。' }
-  if (opt.codec === 'libx265' && !hasHEVCHW.value)
+function getCodecWarnLevel(codec: string): 'caution' | 'strong' | null {
+  if (codec === 'av1'  && !hasAV1HW.value)  return 'strong'
+  if (codec === 'h265' && !hasHEVCHW.value) return 'caution'
+  return null
+}
+
+function selectVideoContainer(container: string) {
+  if (!isContainerDisabled(container)) store.setFormat(container)
+}
+
+function selectVideoCodec(codec: string) {
+  if (isCodecDisabled(codec)) return
+  store.setSelectedCodec(codec)
+  // If the current container is now incompatible, fall back to MP4
+  const fmt = store.selectedFormat
+  if (fmt && isContainerDisabled(fmt)) store.setFormat('mp4')
+}
+
+const videoConvertWarning = computed((): { level: 'caution' | 'strong'; message: string } | null => {
+  const codec = store.selectedCodec
+  if (codec === 'av1' && !hasAV1HW.value)
+    return { level: 'strong',  message: 'AV1 のハードウェアエンコーダが見つかりません。CPU エンコードは非常に時間がかかります。' }
+  if (codec === 'h265' && !hasHEVCHW.value)
     return { level: 'caution', message: 'H.265 のハードウェアエンコーダが見つかりません。長い動画は CPU エンコードで数分〜数十分かかる場合があります。' }
   return null
 })
-
-function selectVideoOption(opt: VideoOption) {
-  store.setFormat(opt.format)
-  store.setSelectedCodec(opt.codec)
-}
-
-const selectedVideoOption = computed(() =>
-  ALL_VIDEO_CONVERT_OPTIONS.find(
-    o => o.format === store.selectedFormat && o.codec === store.selectedCodec,
-  )?.value ?? null,
-)
 
 const showVideoConvertOptions = computed(() =>
   info.value?.type === 'video' && mode.value === 'convert',
@@ -185,11 +199,10 @@ const showCodecPicker = computed(() =>
   info.value?.type === 'video' && mode.value !== 'convert',
 )
 
-// Warn about slow codecs in the compress/size-limit codec picker
 const videoCodecOptions = computed(() => [
-  { value: null,      label: '自動',         note: '品質優先で自動選択',           warn: false },
-  { value: 'libx264', label: 'H.264',        note: '互換性最高・高速',             warn: false },
-  { value: 'libx265', label: 'H.265 / HEVC', note: hasHEVCHW.value ? '高圧縮' : '高圧縮 (CPU・低速)', warn: !hasHEVCHW.value },
+  { value: null,   label: '自動',         note: 'HW優先で自動選択',                                          warn: false },
+  { value: 'h264', label: 'H.264',        note: hasH264HW.value ? 'HW · 互換性最高' : 'CPU · 互換性最高',    warn: false },
+  { value: 'h265', label: 'H.265 / HEVC', note: hasHEVCHW.value ? 'HW · 高圧縮'    : 'CPU · 高圧縮 (低速)', warn: !hasHEVCHW.value },
 ])
 
 // ── Quality ────────────────────────────────────────────────────────────────
@@ -233,7 +246,10 @@ const isLosslessFormat = computed(() => {
 const canExecute = computed(() => {
   if (mode.value === 'size-limit') return store.targetSizeBytes !== null
   if (mode.value === 'convert') {
-    if (info.value?.type === 'video') return selectedVideoOption.value !== null
+    if (info.value?.type === 'video') {
+      const fmt = store.selectedFormat
+      return !!fmt && !!store.selectedCodec && !isContainerDisabled(fmt)
+    }
     return store.selectedFormat !== null
   }
   return true
@@ -259,10 +275,11 @@ const outputFormatLabel = computed(() => {
   if (s) return s.toUpperCase()
   // In compress mode, output format = input format
   if (store.processMode === 'compress') return inputFormatLabel.value
-  // For video convert, show the bundled option label
-  if (showVideoConvertOptions.value && selectedVideoOption.value) {
-    const opt = ALL_VIDEO_CONVERT_OPTIONS.find(o => o.value === selectedVideoOption.value)
-    if (opt) return `${opt.label} / ${opt.codec.includes('264') ? 'H.264' : opt.codec.includes('av1') ? 'AV1' : 'H.265'}`
+  // For video convert, show container / codec
+  if (showVideoConvertOptions.value && store.selectedFormat && store.selectedCodec) {
+    const container = VIDEO_CONTAINERS.find(c => c.value === store.selectedFormat)
+    const codec = VIDEO_CODECS.find(c => c.value === store.selectedCodec)
+    if (container && codec) return `${container.label} / ${codec.label}`
   }
   return null
 })
@@ -340,34 +357,57 @@ const outputFormatLabel = computed(() => {
 
     <!-- ② 形式 / コーデック（モード別） -->
 
-    <!-- 動画 convert: 形式+コーデック束ねた選択肢 -->
-    <div v-if="showVideoConvertOptions" class="section">
-      <span class="section-label">出力形式 / コーデック</span>
-      <div class="option-btns">
-        <button
-          v-for="opt in VIDEO_CONVERT_OPTIONS"
-          :key="opt.value"
-          class="option-btn"
-          :class="{
-            active: selectedVideoOption === opt.value,
-            'warn-caution': opt.warnLevel === 'caution',
-            'warn-strong':  opt.warnLevel === 'strong',
-          }"
-          @click="selectVideoOption(opt)"
-        >
-          {{ opt.label }}
-          <span class="option-note">{{ opt.note }}</span>
-          <span v-if="opt.warnLevel === 'strong'"  class="hw-badge hw-none">HW なし</span>
-          <span v-else-if="opt.warnLevel === 'caution'" class="hw-badge hw-slow">低速</span>
-        </button>
+    <!-- 動画 convert: コンテナとコーデック別々選択 -->
+    <template v-if="showVideoConvertOptions">
+      <div class="section">
+        <span class="section-label">コンテナ</span>
+        <div class="option-btns">
+          <button
+            v-for="c in VIDEO_CONTAINERS"
+            :key="c.value"
+            class="option-btn"
+            :class="{
+              active:        store.selectedFormat === c.value,
+              'opt-disabled': isContainerDisabled(c.value),
+            }"
+            :title="isContainerDisabled(c.value) ? '選択中のコーデックと組み合わせできません' : ''"
+            @click="selectVideoContainer(c.value)"
+          >
+            {{ c.label }}
+            <span class="option-note">{{ c.note }}</span>
+          </button>
+        </div>
       </div>
-      <p v-if="!selectedVideoOption" class="config-hint">形式を選択してください</p>
-      <!-- Warning for selected option -->
-      <p v-if="selectedVideoWarning" class="warn-hint" :class="selectedVideoWarning.level">
-        {{ selectedVideoWarning.level === 'strong' ? '⚠️' : '⚠' }}
-        {{ selectedVideoWarning.message }}
-      </p>
-    </div>
+      <div class="section">
+        <span class="section-label">コーデック</span>
+        <div class="option-btns">
+          <button
+            v-for="cd in VIDEO_CODECS"
+            :key="cd.value"
+            class="option-btn"
+            :class="{
+              active:          store.selectedCodec === cd.value,
+              'opt-disabled':  isCodecDisabled(cd.value),
+              'warn-caution':  getCodecWarnLevel(cd.value) === 'caution',
+              'warn-strong':   getCodecWarnLevel(cd.value) === 'strong',
+            }"
+            :title="isCodecDisabled(cd.value) ? 'HWエンコーダなし。設定から CPU AV1 を許可してください' : ''"
+            @click="selectVideoCodec(cd.value)"
+          >
+            {{ cd.label }}
+            <span class="option-note">{{ cd.note }}</span>
+            <span v-if="getCodecHwBadge(cd.value)" class="hw-badge hw-ok">HW</span>
+            <span v-else-if="getCodecWarnLevel(cd.value) === 'strong'"  class="hw-badge hw-none">HW なし</span>
+            <span v-else-if="getCodecWarnLevel(cd.value) === 'caution'" class="hw-badge hw-slow">低速</span>
+          </button>
+        </div>
+        <p v-if="!store.selectedCodec" class="config-hint">コーデックを選択してください</p>
+        <p v-else-if="videoConvertWarning" class="warn-hint" :class="videoConvertWarning.level">
+          {{ videoConvertWarning.level === 'strong' ? '⚠️' : '⚠' }}
+          {{ videoConvertWarning.message }}
+        </p>
+      </div>
+    </template>
 
     <!-- 画像 / 音声 convert: フォーマット選択 -->
     <div v-else-if="mode === 'convert'" class="section">
@@ -679,6 +719,8 @@ const outputFormatLabel = computed(() => {
 
 .option-btn:hover              { border-color: var(--border-hover); }
 .option-btn.active             { border-color: var(--accent); color: var(--accent); }
+.option-btn.opt-disabled       { opacity: 0.35; cursor: not-allowed; }
+.option-btn.opt-disabled:hover { border-color: var(--border); }
 .option-btn.warn.active        { border-color: #f59e0b; color: #f59e0b; }
 .option-btn.warn-caution       { border-color: rgba(245,158,11,0.4); }
 .option-btn.warn-caution.active{ border-color: #f59e0b; color: #f59e0b; }

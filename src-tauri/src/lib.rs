@@ -17,6 +17,11 @@ use ffmpeg_dl::{resolve_ffmpeg, resolve_ffprobe};
 
 pub struct ProcessRegistry(pub Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>);
 
+pub struct AvifPaths {
+    pub enc: Mutex<Option<String>>,
+    pub dec: Mutex<Option<String>>,
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -265,8 +270,8 @@ fn tmp_png_path(input: &str, suffix: &str) -> String {
 }
 
 /// Decode AVIF → PNG using avifdec (preserves alpha).
-async fn run_avifdec(input: &str, output: &str) -> Result<(), String> {
-    let dec = avif::resolve_avifdec();
+async fn run_avifdec(input: &str, output: &str, custom_dec: Option<&str>) -> Result<(), String> {
+    let dec = avif::resolve_avifdec(custom_dec);
     let out = Command::new(&dec)
         .args([input, output])
         .stdout(std::process::Stdio::null())
@@ -351,6 +356,43 @@ fn build_video_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, Strin
             let preset = if video_codec.contains("x265") { "medium" } else { "fast" };
             args.extend(["-preset".to_string(), preset.to_string()]);
         }
+    } else if video_codec.contains("nvenc") {
+        if !has_size_target {
+            if video_codec.contains("av1") {
+                // AV1 NVENC defaults to CBR; -b:v 0 enables VBR quality mode (-cq).
+                args.extend([
+                    "-b:v".to_string(), "0".to_string(),
+                    "-cq".to_string(), quality.to_string(),
+                    "-preset".to_string(), "p4".to_string(),
+                    "-pix_fmt".to_string(), "yuv420p".to_string(),
+                ]);
+            } else {
+                // H.264/H.265 NVENC: VBR is the default mode, -cq works directly.
+                args.extend([
+                    "-cq".to_string(), quality.to_string(),
+                    "-preset".to_string(), "p4".to_string(),
+                ]);
+            }
+        }
+    } else if video_codec.contains("amf") {
+        // AMF: fixed QP mode
+        if !has_size_target {
+            args.extend([
+                "-quality".to_string(), "balanced".to_string(),
+                "-qp_i".to_string(), quality.to_string(),
+                "-qp_p".to_string(), quality.to_string(),
+            ]);
+        }
+    } else if video_codec.contains("qsv") {
+        // QSV: global_quality (ICQ mode; same numeric range as CRF)
+        if !has_size_target {
+            args.extend(["-global_quality".to_string(), quality.to_string()]);
+        }
+    } else if video_codec.contains("videotoolbox") {
+        // VideoToolbox has no CRF — use a fixed average bitrate as fallback
+        if !has_size_target {
+            args.extend(["-b:v".to_string(), "4000k".to_string()]);
+        }
     }
     args.extend(["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "128k".to_string()]);
 
@@ -396,11 +438,12 @@ fn build_image_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, Strin
             ]);
         }
         "avif" => {
-            // SVT-AV1 is available on Homebrew ffmpeg; libaom-av1 typically is not.
-            // For AVIF still images, SVT-AV1 + -crf works correctly.
+            // SVT-AV1 requires even width/height and yuv420p.
+            // The vf filter normalises both; resize (if any) is prepended below.
             args.extend([
                 "-c:v".to_string(), "libsvtav1".to_string(),
                 "-crf".to_string(), ((100 - quality) / 2).to_string(),
+                "-preset".to_string(), "8".to_string(),
             ]);
         }
         "jpg" | "jpeg" => {
@@ -430,6 +473,18 @@ fn build_image_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, Strin
         }
     }
 
+    // SVT-AV1 requires even dimensions and yuv420p.
+    // Append to any existing -vf chain, or create one.
+    if format == "avif" {
+        const AVIF_TAIL: &str = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p";
+        if let Some(pos) = args.iter().position(|a| a == "-vf") {
+            let existing = args[pos + 1].clone();
+            args[pos + 1] = format!("{},{}", existing, AVIF_TAIL);
+        } else {
+            args.extend(["-vf".to_string(), AVIF_TAIL.to_string()]);
+        }
+    }
+
     args.push(out.clone());
     (args, out)
 }
@@ -437,9 +492,22 @@ fn build_image_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, Strin
 fn build_audio_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, String) {
     let format = opts.format.as_deref().unwrap_or("opus");
     let out = output_path(input, Some(format));
+    let mut args = vec!["-i".to_string(), input.to_string(), "-y".to_string()];
 
-    // Quality preset → bitrate: target.quality is kbps when set by the new UI.
-    // Falls back to use-case heuristics for backward compatibility.
+    // FLAC: lossless, uses compression level not bitrate, requires integer PCM.
+    // Most sources decode to fltp (float planar); aformat converts to s32 first.
+    if format == "flac" {
+        args.extend([
+            "-vn".to_string(),
+            "-af".to_string(), "aformat=sample_fmts=s32".to_string(),
+            "-c:a".to_string(), "flac".to_string(),
+            "-compression_level".to_string(), "8".to_string(),
+        ]);
+        args.push(out.clone());
+        return (args, out);
+    }
+
+    // Lossy formats: compute bitrate
     let bitrate = if let Some(q) = opts.target.as_ref().and_then(|t| t.quality) {
         format!("{}k", q)
     } else {
@@ -460,14 +528,14 @@ fn build_audio_args(opts: &ProcessOptionsJs, input: &str) -> (Vec<String>, Strin
         "opus" | "ogg" => "libopus",
         "aac" | "m4a"  => "aac",
         "mp3"          => "libmp3lame",
+        "wav"          => "pcm_s16le",
         _              => "libopus",
     };
 
-    let mut args = vec!["-i".to_string(), input.to_string(), "-y".to_string()];
     args.extend([
+        "-vn".to_string(),
         "-c:a".to_string(), audio_codec.to_string(),
         "-b:a".to_string(), bitrate.to_string(),
-        "-vn".to_string(),
     ]);
     args.push(out.clone());
     (args, out)
@@ -556,9 +624,34 @@ async fn analyze_file(path: String, app: AppHandle) -> Result<MediaInfo, String>
     do_analyze(&path, &app).await
 }
 
+/// Test an encoder by running a 1-frame synthetic encode.
+/// Needed for AV1 HW encoders: they appear in -encoders on older GPUs
+/// (e.g. av1_nvenc on Ampere / RTX 30xx) but fail at runtime because the
+/// hardware doesn't actually support that codec generation.
+async fn probe_hw_encoder(ffmpeg: &str, encoder: &str) -> bool {
+    // Probe only checks whether the encoder hardware is usable — no quality params.
+    // av1_nvenc defaults to CBR and rejects bare -cq, so we omit quality flags here;
+    // they are set separately during actual encoding.
+    Command::new(ffmpeg)
+        .args([
+            "-f", "lavfi", "-i", "color=black:size=128x128:rate=1",
+            "-vf", "format=yuv420p",
+            "-frames:v", "1",
+            "-c:v", encoder,
+            "-f", "null", "-",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 async fn detect_hw_accel(app: AppHandle) -> Result<Vec<String>, String> {
-    let output = Command::new(resolve_ffmpeg(&app))
+    let ffmpeg = resolve_ffmpeg(&app);
+    let output = Command::new(&ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
         .await
@@ -567,6 +660,11 @@ async fn detect_hw_accel(app: AppHandle) -> Result<Vec<String>, String> {
     let text = String::from_utf8_lossy(&output.stdout).to_string()
         + &String::from_utf8_lossy(&output.stderr);
 
+    // Presence in the encoder list is our primary signal.
+    // probe_hw_encoder() was intended to filter AV1 on Ampere (which lists av1_nvenc
+    // but can't execute it), but the probe itself has proven unreliable across setups.
+    // We now trust the list; if an encoder truly doesn't work the encode will fail with
+    // a descriptive error rather than a silent "HW なし" false negative.
     let hw_encoders = [
         ("av1_nvenc",         "nvenc_av1"),
         ("av1_amf",           "amf_av1"),
@@ -594,6 +692,7 @@ async fn process_file(
     options: serde_json::Value,
     on_progress: Channel<ProcessProgress>,
     registry: State<'_, ProcessRegistry>,
+    avif_paths: State<'_, AvifPaths>,
     app: AppHandle,
 ) -> Result<ProcessResult, String> {
     let opts: ProcessOptionsJs = serde_json::from_value(options)
@@ -614,11 +713,13 @@ async fn process_file(
     };
 
     let output_fmt = opts.format.as_deref().unwrap_or("").to_string();
+    let custom_enc = avif_paths.enc.lock().unwrap().clone();
+    let custom_dec = avif_paths.dec.lock().unwrap().clone();
 
     // ── AVIF output via avifenc ───────────────────────────────────────────
     // avifenc handles alpha natively; FFmpeg's libsvtav1 does not.
     if media_type == "image" && output_fmt == "avif" {
-        let avif_status = avif::check_status().await;
+        let avif_status = avif::check_status(custom_enc.as_deref(), custom_dec.as_deref()).await;
         if avif_status.available {
             let quality_input = opts.target.as_ref().and_then(|t| t.quality).unwrap_or(80);
             // avifenc quality scale: 100 = lossless, 0 = worst.
@@ -634,7 +735,7 @@ async fn process_file(
             // All other inputs: use FFmpeg (handles WebP, HEIC, JPEG, etc.).
             let tmp_png = tmp_png_path(&input, "enc_tmp");
             let decode_result = if ext == "avif" && avif_status.avifdec_available {
-                run_avifdec(&input, &tmp_png).await
+                run_avifdec(&input, &tmp_png, custom_dec.as_deref()).await
             } else {
                 run_ffmpeg_to_png(&resolve_ffmpeg(&app), &input, &tmp_png, resize).await
             };
@@ -656,7 +757,7 @@ async fn process_file(
             registry.0.lock().unwrap().insert(file_id.clone(), kill_tx);
 
             let quality_str = quality.to_string();
-            let enc = avif::resolve_avifenc();
+            let enc = avif::resolve_avifenc(custom_enc.as_deref());
             let mut child = match Command::new(&enc)
                 .args([&tmp_png, "-q", &quality_str, "-j", "8", "-o", &out_path])
                 .stdout(std::process::Stdio::null())
@@ -729,15 +830,38 @@ async fn process_file(
                 error: None,
             });
         }
-        // avifenc not available: fall through to FFmpeg path (no alpha support)
+        // avifenc not available: fall through to FFmpeg only if an AV1 encoder is present.
+        // gyan.dev essentials (the default Windows download) omits libsvtav1; without this
+        // check FFmpeg fails with a cryptic filter-thread -22 (Invalid argument) error.
+        let ffmpeg_has_av1 = Command::new(resolve_ffmpeg(&app))
+            .args(["-hide_banner", "-encoders"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output().await
+            .map(|o| {
+                let s = String::from_utf8_lossy(&o.stdout);
+                ["libsvtav1", "libaom-av1", "librav1e"].iter().any(|e| s.contains(e))
+            })
+            .unwrap_or(false);
+        if !ffmpeg_has_av1 {
+            return Ok(ProcessResult {
+                success: false, output_path: String::new(),
+                original_size, output_size: 0,
+                duration: start.elapsed().as_millis() as u64,
+                error: Some(
+                    "AVIF 変換には avifenc が必要です。\
+                     「コーデック状況」から avifenc / avifdec のパスを設定してください。".to_string(),
+                ),
+            });
+        }
     }
 
     // ── AVIF input decode via avifdec (preserves alpha for non-AVIF output) ─
     let (actual_input, tmp_avif_png) = if ext == "avif" && output_fmt != "avif" {
-        let avif_status = avif::check_status().await;
+        let avif_status = avif::check_status(custom_enc.as_deref(), custom_dec.as_deref()).await;
         if avif_status.avifdec_available {
             let tmp = tmp_png_path(&input, "dec_tmp");
-            match run_avifdec(&input, &tmp).await {
+            match run_avifdec(&input, &tmp, custom_dec.as_deref()).await {
                 Ok(_) => (tmp.clone(), Some(tmp)),
                 Err(_) => (input.clone(), None), // fall back to direct FFmpeg
             }
@@ -911,8 +1035,21 @@ async fn save_from_preview(
 // ── avifenc commands ─────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn check_avifenc() -> avif::AvifencStatus {
-    avif::check_status().await
+async fn set_avifenc_paths(
+    enc: Option<String>,
+    dec: Option<String>,
+    avif_paths: State<'_, AvifPaths>,
+) -> Result<(), String> {
+    *avif_paths.enc.lock().unwrap() = enc;
+    *avif_paths.dec.lock().unwrap() = dec;
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_avifenc(avif_paths: State<'_, AvifPaths>) -> Result<avif::AvifencStatus, String> {
+    let enc = avif_paths.enc.lock().unwrap().clone();
+    let dec = avif_paths.dec.lock().unwrap().clone();
+    Ok(avif::check_status(enc.as_deref(), dec.as_deref()).await)
 }
 
 #[tauri::command]
@@ -942,6 +1079,7 @@ async fn preview_image(
     input: String,
     options: serde_json::Value,
     registry: State<'_, ProcessRegistry>,
+    avif_paths: State<'_, AvifPaths>,
     app: AppHandle,
 ) -> Result<PreviewResult, String> {
     let opts: ProcessOptionsJs = serde_json::from_value(options)
@@ -950,6 +1088,8 @@ async fn preview_image(
     let ext = Path::new(&input).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let output_fmt = opts.format.as_deref().unwrap_or("jpg").to_string();
     let out = preview_output_path(&app, &preview_id, &output_fmt);
+    let custom_enc = avif_paths.enc.lock().unwrap().clone();
+    let custom_dec = avif_paths.dec.lock().unwrap().clone();
 
     let dir = preview_cache_dir(&app);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache dir: {e}"))?;
@@ -969,7 +1109,7 @@ async fn preview_image(
 
     // ── AVIF output via avifenc ──────────────────────────────────────────
     if output_fmt == "avif" {
-        let avif_status = avif::check_status().await;
+        let avif_status = avif::check_status(custom_enc.as_deref(), custom_dec.as_deref()).await;
         if avif_status.available {
             let quality_input = opts.target.as_ref().and_then(|t| t.quality).unwrap_or(80);
             let quality = ((quality_input as f64 * 0.65) as u32).clamp(1, 95);
@@ -978,7 +1118,7 @@ async fn preview_image(
 
             check_cancel!();
             let decode_result = if ext == "avif" && avif_status.avifdec_available {
-                run_avifdec(&input, &tmp_png).await
+                run_avifdec(&input, &tmp_png, custom_dec.as_deref()).await
             } else {
                 run_ffmpeg_to_png(&resolve_ffmpeg(&app), &input, &tmp_png, resize).await
             };
@@ -989,7 +1129,7 @@ async fn preview_image(
 
             check_cancel!();
             let quality_str = quality.to_string();
-            let enc = avif::resolve_avifenc();
+            let enc = avif::resolve_avifenc(custom_enc.as_deref());
             let mut child = match Command::new(&enc)
                 .args([&tmp_png, "-q", &quality_str, "-j", "8", "-o", &out])
                 .stdout(std::process::Stdio::null())
@@ -1029,14 +1169,32 @@ async fn preview_image(
             let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
             return Ok(PreviewResult { path: out, output_size: size });
         }
+        // avifenc not available: fall through only if FFmpeg has an AV1 encoder
+        let ffmpeg_has_av1 = Command::new(resolve_ffmpeg(&app))
+            .args(["-hide_banner", "-encoders"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output().await
+            .map(|o| {
+                let s = String::from_utf8_lossy(&o.stdout);
+                ["libsvtav1", "libaom-av1", "librav1e"].iter().any(|e| s.contains(e))
+            })
+            .unwrap_or(false);
+        if !ffmpeg_has_av1 {
+            registry.0.lock().unwrap().remove(&preview_id);
+            return Err(
+                "AVIF 変換には avifenc が必要です。\
+                 「コーデック状況」から avifenc / avifdec のパスを設定してください。".to_string(),
+            );
+        }
     }
 
     // ── AVIF input → avifdec → FFmpeg ────────────────────────────────────
     let (actual_input, tmp_avif_dec) = if ext == "avif" && output_fmt != "avif" {
-        let avif_status = avif::check_status().await;
+        let avif_status = avif::check_status(custom_enc.as_deref(), custom_dec.as_deref()).await;
         if avif_status.avifdec_available {
             let tmp = format!("{}.dec.png", out);
-            match run_avifdec(&input, &tmp).await {
+            match run_avifdec(&input, &tmp, custom_dec.as_deref()).await {
                 Ok(_) => (tmp.clone(), Some(tmp)),
                 Err(_) => (input.clone(), None),
             }
@@ -1311,6 +1469,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessRegistry(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(AvifPaths { enc: Mutex::new(None), dec: Mutex::new(None) })
         .invoke_handler(tauri::generate_handler![
             analyze_file,
             detect_hw_accel,
@@ -1320,6 +1479,7 @@ pub fn run() {
             get_encoder_caps,
             check_ffmpeg,
             download_ffmpeg,
+            set_avifenc_paths,
             check_avifenc,
             install_avifenc,
             save_from_preview,

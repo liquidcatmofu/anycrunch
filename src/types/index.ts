@@ -100,6 +100,8 @@ export interface ProcessResult {
 
 export interface AppSettings {
   ffmpegPath?: string
+  avifencPath?: string
+  avifdecPath?: string
   allowCpuAV1: boolean
 }
 

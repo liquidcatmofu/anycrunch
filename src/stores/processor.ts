@@ -99,7 +99,13 @@ export const useProcessorStore = defineStore('processor', {
     result: null as ProcessResult | null,
     error: null as string | null,
     currentFileId: null as string | null,
-    settings: { allowCpuAV1: false } as AppSettings,
+    settings: (() => {
+      try {
+        const stored = localStorage.getItem('anycrunch-settings')
+        if (stored) return { allowCpuAV1: false, ...JSON.parse(stored) } as AppSettings
+      } catch {}
+      return { allowCpuAV1: false } as AppSettings
+    })(),
 
     ffmpegStatus: null as FfmpegStatus | null,
     avifencStatus: null as AvifencStatus | null,
@@ -143,6 +149,43 @@ export const useProcessorStore = defineStore('processor', {
         if (ext) format = ext === 'jpeg' ? 'jpg' : ext === 'm4a' ? 'aac' : ext
       }
 
+      // Resolve logical video codec names to the best available encoder.
+      // For compress mode with no explicit codec, also try HW.
+      let codec: string | undefined = this.selectedCodec ?? undefined
+      if (type === 'video') {
+        const hw = this.hwAccel
+        const bestH264 = hw.includes('nvenc_h264')         ? 'h264_nvenc'
+                       : hw.includes('amf_h264')           ? 'h264_amf'
+                       : hw.includes('qsv_h264')           ? 'h264_qsv'
+                       : hw.includes('videotoolbox_h264')  ? 'h264_videotoolbox'
+                       : 'libx264'
+        const bestH265 = hw.includes('nvenc_hevc')         ? 'hevc_nvenc'
+                       : hw.includes('amf_hevc')           ? 'hevc_amf'
+                       : hw.includes('qsv_hevc')           ? 'hevc_qsv'
+                       : hw.includes('videotoolbox_hevc')  ? 'hevc_videotoolbox'
+                       : 'libx265'
+        const bestAV1  = hw.includes('nvenc_av1')          ? 'av1_nvenc'
+                       : hw.includes('amf_av1')            ? 'av1_amf'
+                       : hw.includes('qsv_av1')            ? 'av1_qsv'
+                       : 'libsvtav1'
+        switch (codec) {
+          case 'h264': codec = bestH264; break
+          case 'h265': codec = bestH265; break
+          case 'av1':  codec = bestAV1;  break
+          case undefined:
+            // compress mode: use HW for the codec the backend would default to
+            if (this.processMode === 'compress')
+              codec = this.effectiveUseCase.type === 'storage' ? bestH265 : bestH264
+            break
+        }
+        // HW AV1 encoders (nvenc/amf/qsv) produce ISO BMFF-compatible bitstream,
+        // not WebM-native AV1. Switch to MKV so the muxer accepts the output.
+        const hwAV1Encoders = ['av1_nvenc', 'av1_amf', 'av1_qsv']
+        if (hwAV1Encoders.includes(codec ?? '') && format === 'webm') {
+          format = 'mkv'
+        }
+      }
+
       return {
         useCase: this.effectiveUseCase,
         format,
@@ -152,7 +195,7 @@ export const useProcessorStore = defineStore('processor', {
             ? (this.targetSizeBytes ?? undefined)
             : undefined,
         },
-        codec: this.selectedCodec ?? undefined,
+        codec,
         description: `mode:${this.processMode} q:${quality}`,
       }
     },
@@ -161,15 +204,35 @@ export const useProcessorStore = defineStore('processor', {
 
     async initFfmpeg() {
       if (!isTauri()) return
+      await invoke('set_avifenc_paths', {
+        enc: this.settings.avifencPath ?? null,
+        dec: this.settings.avifdecPath ?? null,
+      })
       const [status, avifStatus, hwAccel] = await Promise.all([
         invoke<FfmpegStatus>('check_ffmpeg'),
-        invoke<AvifencStatus>('check_avifenc'),
+        invoke<AvifencStatus>('check_avifenc').catch(() => null as AvifencStatus | null),
         invoke<string[]>('detect_hw_accel'),
       ])
       this.ffmpegStatus = status
       this.avifencStatus = avifStatus
       this.hwAccel = hwAccel
       if (!status.available) this.phase = 'setup'
+    },
+
+    saveSettings() {
+      try {
+        localStorage.setItem('anycrunch-settings', JSON.stringify(this.settings))
+      } catch {}
+    },
+
+    async updateAvifPaths(enc?: string, dec?: string) {
+      this.settings.avifencPath = enc || undefined
+      this.settings.avifdecPath = dec || undefined
+      this.saveSettings()
+      if (isTauri()) {
+        await invoke('set_avifenc_paths', { enc: enc ?? null, dec: dec ?? null })
+        this.avifencStatus = await invoke<AvifencStatus>('check_avifenc')
+      }
     },
 
     async downloadFfmpeg() {
@@ -323,7 +386,13 @@ export const useProcessorStore = defineStore('processor', {
     reset() {
       if (previewDebounceTimer) { clearTimeout(previewDebounceTimer); previewDebounceTimer = null }
       if (isTauri()) invoke('cleanup_preview_cache').catch(() => {})
+      // Preserve capability state — initFfmpeg() is only called once at startup
+      const { ffmpegStatus, avifencStatus, hwAccel, settings } = this
       this.$reset()
+      this.ffmpegStatus   = ffmpegStatus
+      this.avifencStatus  = avifencStatus
+      this.hwAccel        = hwAccel
+      this.settings       = settings
     },
 
     // ── Preview ───────────────────────────────────────────────────────────

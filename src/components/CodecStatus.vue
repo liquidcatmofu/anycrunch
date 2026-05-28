@@ -52,13 +52,25 @@ const avifInstallLog = ref<string[]>([])
 const avifInstallError = ref<string | null>(null)
 const avifLogBox = ref<HTMLElement | null>(null)
 
+const customEncPath = ref(store.settings.avifencPath ?? '')
+const customDecPath = ref(store.settings.avifdecPath ?? '')
+const pathSaving = ref(false)
+
 watch(() => avifInstallLog.value.length, async () => {
   await nextTick()
   if (avifLogBox.value) avifLogBox.value.scrollTop = avifLogBox.value.scrollHeight
 })
 
 async function refreshAvifStatus() {
-  avifStatus.value = await invoke<AvifencStatus>('check_avifenc')
+  avifStatus.value = await invoke<AvifencStatus>('check_avifenc').catch(() => null)
+  if (avifStatus.value) store.avifencStatus = avifStatus.value
+}
+
+async function applyAvifPaths() {
+  pathSaving.value = true
+  await store.updateAvifPaths(customEncPath.value, customDecPath.value)
+  avifStatus.value = store.avifencStatus
+  pathSaving.value = false
 }
 
 async function installAvifenc() {
@@ -314,6 +326,27 @@ function reinstall() {
   store.downloadFfmpeg()
   emit('close') // close modal; FfmpegSetup shows the download progress
 }
+
+// ── Full encoder/decoder list ──────────────────────────────────────────────
+
+type HwVendor = 'nvidia' | 'amd' | 'intel' | 'apple' | 'hw-other' | null
+
+function hwVendor(name: string): HwVendor {
+  if (/nvenc|cuvid/.test(name))                         return 'nvidia'
+  if (/amf/.test(name))                                 return 'amd'
+  if (/qsv/.test(name))                                 return 'intel'
+  if (/videotoolbox/.test(name))                        return 'apple'
+  if (/vaapi|vulkan|d3d12va|dxva|v4l2m2m/.test(name))  return 'hw-other'
+  return null
+}
+
+const hwVendorLabel: Record<NonNullable<HwVendor>, string> = {
+  nvidia:   'NVIDIA',
+  amd:      'AMD',
+  intel:    'Intel',
+  apple:    'Apple',
+  'hw-other': 'HW',
+}
 </script>
 
 <template>
@@ -468,12 +501,67 @@ function reinstall() {
                 <div class="guide-commands">
                   <code>brew install libavif</code>
                   <code>apt install libavif-bin</code>
-                  <code>winget install libavif</code>
                 </div>
+                <p class="guide-note">Windows では winget での導入は非対応です。<a href="https://github.com/AOMediaCodec/libavif/releases" target="_blank">libavif リリースページ</a>から手動でダウンロードしてください。</p>
               </div>
             </template>
+
+            <!-- Custom path input (always shown) -->
+            <div class="avif-custom-path">
+              <p class="guide-label">手動インストールのパス指定：</p>
+              <label class="path-row">
+                <span class="path-label">avifenc</span>
+                <input v-model="customEncPath" class="path-input" placeholder="例: C:\tools\avifenc.exe または /usr/local/bin/avifenc" />
+              </label>
+              <label class="path-row">
+                <span class="path-label">avifdec</span>
+                <input v-model="customDecPath" class="path-input" placeholder="例: C:\tools\avifdec.exe または /usr/local/bin/avifdec" />
+              </label>
+              <button class="path-apply-btn" :disabled="pathSaving" @click="applyAvifPaths">
+                {{ pathSaving ? '確認中...' : '適用して確認' }}
+              </button>
+            </div>
           </div>
         </div>
+
+        <!-- Full encoder / decoder list -->
+        <details class="build-flags">
+          <summary>全エンコーダ / デコーダ一覧</summary>
+          <div class="full-codec-cols">
+            <div class="full-codec-col">
+              <p class="full-codec-heading">エンコーダ ({{ info.encoders.length }})</p>
+              <div class="full-codec-chips">
+                <span
+                  v-for="enc in info.encoders"
+                  :key="enc"
+                  class="full-chip"
+                  :class="hwVendor(enc) ? `hw-${hwVendor(enc)}` : ''"
+                  :title="hwVendor(enc) ? hwVendorLabel[hwVendor(enc)!] : ''"
+                >{{ enc }}</span>
+              </div>
+            </div>
+            <div class="full-codec-col">
+              <p class="full-codec-heading">デコーダ ({{ info.decoders.length }})</p>
+              <div class="full-codec-chips">
+                <span
+                  v-for="dec in info.decoders"
+                  :key="dec"
+                  class="full-chip"
+                  :class="hwVendor(dec) ? `hw-${hwVendor(dec)}` : ''"
+                  :title="hwVendor(dec) ? hwVendorLabel[hwVendor(dec)!] : ''"
+                >{{ dec }}</span>
+              </div>
+            </div>
+          </div>
+          <!-- Legend -->
+          <div class="hw-legend">
+            <span class="full-chip hw-nvidia">NVIDIA</span>
+            <span class="full-chip hw-amd">AMD</span>
+            <span class="full-chip hw-intel">Intel</span>
+            <span class="full-chip hw-apple">Apple</span>
+            <span class="full-chip hw-hw-other">その他HW</span>
+          </div>
+        </details>
 
         <!-- Build flags -->
         <details class="build-flags">
@@ -834,6 +922,68 @@ function reinstall() {
   color: var(--muted);
 }
 
+.guide-note {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+.guide-note a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.guide-note a:hover { text-decoration: underline; }
+
+.avif-custom-path {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.path-label {
+  font-size: 0.78rem;
+  font-family: monospace;
+  color: var(--muted);
+  min-width: 60px;
+}
+
+.path-input {
+  flex: 1;
+  font-size: 0.78rem;
+  font-family: monospace;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 5px;
+  outline: none;
+}
+.path-input:focus { border-color: var(--accent); }
+
+.path-apply-btn {
+  align-self: flex-start;
+  font-size: 0.8rem;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 5px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.path-apply-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.path-apply-btn:hover:not(:disabled) { opacity: 0.85; }
+
 .avif-installing {
   display: flex;
   flex-direction: column;
@@ -875,6 +1025,46 @@ function reinstall() {
 }
 
 .avif-log-line { white-space: pre-wrap; word-break: break-all; }
+
+/* Full encoder/decoder list */
+.full-codec-cols {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+}
+.full-codec-col { flex: 1; min-width: 0; }
+.full-codec-heading {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+.full-codec-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.full-chip {
+  font-size: 0.7rem;
+  font-family: monospace;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: var(--bg);
+  white-space: nowrap;
+}
+.full-chip.hw-nvidia   { background: rgba(118,185,0,0.12);  color: #76b900; border-color: rgba(118,185,0,0.4); }
+.full-chip.hw-amd      { background: rgba(237,28,36,0.1);   color: #ed4444; border-color: rgba(237,28,36,0.35); }
+.full-chip.hw-intel    { background: rgba(0,150,255,0.1);   color: #0096ff; border-color: rgba(0,150,255,0.35); }
+.full-chip.hw-apple    { background: rgba(160,160,160,0.1); color: #aaa;    border-color: rgba(160,160,160,0.35); }
+.full-chip.hw-hw-other { background: rgba(100,200,100,0.1); color: #64c864; border-color: rgba(100,200,100,0.35); }
+.hw-legend {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
 
 /* Build flags */
 .build-flags {

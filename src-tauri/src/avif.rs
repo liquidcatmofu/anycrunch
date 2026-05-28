@@ -1,34 +1,40 @@
-use std::path::Path;
+#[allow(unused_imports)]
 use std::process::Stdio;
+use std::path::Path;
 use serde::Serialize;
 use tauri::ipc::Channel;
+#[allow(unused_imports)]
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
 // ── Path resolution ───────────────────────────────────────────────────────
 
-pub fn resolve_avifenc() -> String {
+pub fn resolve_avifenc(custom: Option<&str>) -> String {
+    if let Some(p) = custom {
+        if !p.is_empty() { return p.to_string(); }
+    }
+    #[cfg(not(target_os = "windows"))]
     for p in [
         "/opt/homebrew/bin/avifenc",
         "/usr/local/bin/avifenc",
         "/usr/bin/avifenc",
     ] {
-        if Path::new(p).exists() {
-            return p.to_string();
-        }
+        if Path::new(p).exists() { return p.to_string(); }
     }
     "avifenc".to_string()
 }
 
-pub fn resolve_avifdec() -> String {
+pub fn resolve_avifdec(custom: Option<&str>) -> String {
+    if let Some(p) = custom {
+        if !p.is_empty() { return p.to_string(); }
+    }
+    #[cfg(not(target_os = "windows"))]
     for p in [
         "/opt/homebrew/bin/avifdec",
         "/usr/local/bin/avifdec",
         "/usr/bin/avifdec",
     ] {
-        if Path::new(p).exists() {
-            return p.to_string();
-        }
+        if Path::new(p).exists() { return p.to_string(); }
     }
     "avifdec".to_string()
 }
@@ -72,9 +78,9 @@ async fn version_of(binary: &str) -> Option<String> {
     combined.lines().next().map(|l| l.trim().to_string())
 }
 
-pub async fn check_status() -> AvifencStatus {
-    let enc_path = resolve_avifenc();
-    let dec_path = resolve_avifdec();
+pub async fn check_status(custom_enc: Option<&str>, custom_dec: Option<&str>) -> AvifencStatus {
+    let enc_path = resolve_avifenc(custom_enc);
+    let dec_path = resolve_avifdec(custom_dec);
 
     let available = probe(&enc_path).await;
     let avifdec_available = probe(&dec_path).await;
@@ -153,7 +159,7 @@ pub async fn do_install(on_progress: Channel<AvifInstallProgress>) -> Result<(),
             message: "動作確認中...".to_string(),
         });
 
-        if !probe(&resolve_avifenc()).await {
+        if !probe(&resolve_avifenc(None)).await {
             return Err("インストール後の確認失敗: avifenc が見つかりません".to_string());
         }
 
